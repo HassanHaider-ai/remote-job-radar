@@ -1,219 +1,376 @@
-# Job Radar: Remote Job Screening Pipeline (Make.com + Gemini)
+# Job Radar: Remote Job Screening Pipeline
 
-An automation that fetches job postings from the free [Arbeitnow API](https://www.arbeitnow.com/blog/job-board-api), keeps only remote jobs that match automation/AI keywords, scores each new job against a candidate profile with Google Gemini, stores the results in a Make Data Store, and emails a digest of the best matches.
+**Built with Make.com, Google Gemini, and the Arbeitnow API**
 
-I built it as a practice project after finishing the Make Academy Advanced course, to apply pagination, data stores, regex, structured AI output and error handling in one working pipeline.
+Job Radar is an automation project that collects job postings from the free Arbeitnow API, filters remote jobs related to AI and automation, scores new jobs with Google Gemini, saves the results in a Make Data Store, and sends an email with the best matches.
 
-> **Status:** built and tested end to end (see [Testing and results](#testing-and-results)). Scenario is kept **inactive** after testing to save credits.
-> **Data:** all screenshots use practice data and practice mailboxes. No API keys or connection details are included in this repository.
+I built this project after completing the Make Academy Advanced course. My goal was to apply pagination, Data Stores, regex, AI integration, and error handling in one practical workflow.
+
+**Project status:** Built and tested through multiple test cases. The Make scenario is kept inactive after testing to save credits.
+
+**Privacy:** Screenshots use practice data and practice email accounts. No API keys or credentials should be included in this repository.
 
 ---
 
-## What it does
+## 1. What It Does
 
-1. Fetches up to N pages of jobs from the Arbeitnow API (page-based pagination).
-2. Validates the response (HTTP status, JSON content type, job array present).
-3. Keeps only **remote** jobs whose **title matches a keyword regex** (automation, AI, n8n, Make.com and similar).
-4. Skips jobs that were **already seen** (checked against the Data Store by slug).
-5. Sends each new job (title, company, location, tags, first 2000 characters of the cleaned description) to **Gemini**, which returns a JSON object: a fit score (0-10) and a one-sentence reason.
-6. Saves every scored job so it is never scored twice.
-7. Builds **one digest email** containing only jobs with a score of 5 or higher.
-8. Sends alert emails and retries when something fails.
+1. Fetches job postings from the free Arbeitnow API using page-based pagination.
+2. Checks the API response before processing the jobs.
+3. Filters for remote jobs with AI and automation-related keywords.
+4. Checks the Data Store to skip jobs that have already been processed.
+5. Sends each new job to Google Gemini for a fit score from 0 to 10 and a short explanation.
+6. Saves the scored job in the Data Store.
+7. Collects jobs with a score of 5 or higher into one email.
+8. Sends alerts when configured HTTP or Gemini operations fail.
 
-## Architecture
+## 2. Architecture
 
-```mermaid
-flowchart LR
-    A["Repeater: pages 1..N"] --> B["HTTP: Arbeitnow API"]
-    B --> C{"Router: valid JSON response?"}
-    C -- "yes" --> D["Iterator: split into jobs"]
-    C -- "fallback" --> X["Alert email: unexpected response"]
-    D --> E["Filter: remote + keyword regex"]
-    E --> F["Data Store: already seen?"]
-    F -- "new only" --> G["Sleep 20 s"]
-    G --> H["Gemini: score 0-10 + reason"]
-    H --> I["Data Store: save job"]
-    I --> J{"score >= 5?"}
-    J -- "yes" --> K["Text aggregator"]
-    K --> L["Gmail: digest"]
-    B -. "error" .-> E1["Alert + Retry"]
-    H -. "error" .-> E2["Alert + Retry"]
-```
+The main workflow is:
 
-Full scenario canvas:
+**Repeater → HTTP → Response Validation → Iterator → Remote and Keyword Filter → Data Store Existence Check → Sleep → Gemini Scoring → Save Job → Score Filter → Text Aggregator → Gmail Digest**
+
+Separate error-handling routes are used for HTTP and Gemini failures. An additional fallback route is intended to handle unexpected API responses.
+
+### Full Scenario
 
 ![Scenario overview](docs/screenshots/01-scenario-overview.png)
 
-## Version history
+## 3. Version History
 
-| Version | What was added |
+| Version | Main feature |
 |---|---|
-| V1 | Fetch jobs, filter remote jobs, save to Data Store (key = slug) |
-| V2 | Only new jobs: existence check before saving, so repeat runs cost almost nothing |
-| V3 | Gemini fit scoring with structured JSON output (score + reason) |
-| V4 | Digest email (score >= 5), error alerts with Retry, response guard (router + fallback) |
+| V1 | Fetch jobs, filter remote jobs, and save them using the job slug as the key |
+| V2 | Check whether a job already exists before processing it again |
+| V3 | Add Gemini scoring with structured JSON output |
+| V4 | Add a digest email, error alerts, Retry handling, and response validation |
 
 ---
 
-## Technical decisions
+## 4. Technical Decisions
 
-**Page-based pagination with a Repeater.** The API returns the next page link in the response body (`links.next`), the last page has an empty `data` array, and the meta numbers are unreliable. The pipeline therefore iterates pages with the Repeater (`?page=i`) and keeps the number of pages small. Newest jobs come first, so a daily run needs few pages.
+### Page-Based Pagination
 
-**Cheap checks first, paid steps last.** Filters and the router are not counted as operations, while every module operation costs a credit. The remote/keyword filter and the "already seen" check therefore come **before** the Gemini call, so only genuinely new, relevant jobs reach the AI step.
+The Arbeitnow API uses page-based pagination. The workflow requests pages using `?page=i`.
 
-**Slug as Data Store key.** The Arbeitnow slug is unique per job. Using it as the key with "overwrite existing record" means a job can never be duplicated, and the existence check is a single lookup.
+The API response includes a `links.next` value, and the last page can return an empty `data` array. The workflow uses a limited number of pages to control execution time and credit usage.
 
-**Keyword regex with word boundaries.** Plain substring matching causes false positives ("AI" inside other words). The filter uses a case-insensitive pattern with `\b` word boundaries for short terms such as AI and KI, and includes German terms (for example "Automatisierung") because the board is German-focused.
+### Filter Before Using AI
 
-**Structured AI output.** The Gemini step uses system instructions for the fixed part (role, candidate profile, scoring rubric, strict JSON format) and the user message for the variable part (the job data). The model returns `{"score": ..., "reason": ...}`, which Make exposes as separate fields, so no extra parsing module is needed.
+Remote and keyword filters run before the Gemini module. The Data Store existence check also comes before AI scoring.
 
-**Description cleaned and truncated.** The raw description is HTML. It is passed through `stripHTML` first and then `substring(..., 0, 2000)`. Stripping first means the 2000 characters are real text, not tags, and it keeps token usage and quota low.
+This reduces unnecessary Gemini requests by excluding irrelevant jobs and jobs that have already been processed.
 
-**Save after scoring.** A job is written to the Data Store only after Gemini succeeds. If Gemini fails, the job is not stored, so it is scored again on a later run and nothing is lost silently.
+### Use the Job Slug as the Key
 
-**Digest grouping.** The text aggregator uses the **Repeater** as its source module, so jobs from all pages end up in a single email instead of one email per page. "Stop processing after an empty aggregation" is enabled, so no empty email is sent when nothing qualifies.
+Each job has a slug that is used as its Data Store key.
 
-**Rate limiting.** The Gemini free tier allowed 5 requests per minute at the time of testing. A Sleep module (20 seconds) before the Gemini call keeps the pipeline under that limit.
+The existence check uses this key to identify previously processed jobs. This helps prevent the same job from being scored repeatedly.
 
-**Response guard.** A bad URL returned HTTP 200 with an HTML page, which Make treated as a success. The router now lets a response through only if the job array exists **and** the `Content-Type` header is JSON; anything else goes to a fallback route that sends an alert.
+### Keyword Regex
 
-**Error handling.** HTTP and Gemini both have an error route: alert email, then Retry (3 retries for HTTP, 2 for Gemini, 15 minutes apart). Retry saves the failed run as an incomplete execution.
+The filter uses a case-insensitive regex to identify AI and automation-related job titles.
+
+Word boundaries (`\b`) help reduce false matches for short keywords such as `AI` and `KI`. German terms such as `Automatisierung` can also be included because Arbeitnow has many German-language listings.
+
+### Structured AI Output
+
+Gemini receives the candidate profile, scoring rules, and job information.
+
+The expected output contains two fields:
+
+- `score`: a number from 0 to 10.
+- `reason`: a short explanation of the score.
+
+Using structured JSON makes it easier to map the results into separate Make fields.
+
+### Clean and Short Job Descriptions
+
+Job descriptions may contain HTML. The workflow removes HTML using `stripHTML` and keeps the first 2,000 characters.
+
+This gives Gemini readable text while limiting the amount of information sent to the model.
+
+### Save Jobs After Successful Scoring
+
+A job is saved after Gemini successfully returns a score.
+
+If Gemini fails, the job is not saved as a completed result. This allows the workflow to try scoring it again on a later run.
+
+### One Digest Email
+
+The Text Aggregator combines qualifying jobs into one digest rather than sending a separate email for every job.
+
+The score filter is set to accept jobs scoring 5 or higher. During testing, the threshold was temporarily lowered to demonstrate the digest workflow.
+
+### Rate Limiting
+
+During testing, the Gemini free tier showed a limit of five requests per minute.
+
+A 20-second Sleep module was added before the Gemini call to leave more time between requests. Provider limits can change, so this timing may need adjustment.
+
+### API Response Validation
+
+During testing, an incorrect API URL returned an HTML page with HTTP status 200. A successful status code alone was not enough to confirm that the response contained valid job data.
+
+The response guard was designed to check the expected job array and the `Content-Type` header. Unexpected responses should go to a fallback route.
+
+**Final verification note:** The router must be tested with both a valid JSON response and an unexpected HTML response before claiming that the final guard works correctly.
+
+### Error Handling
+
+HTTP and Gemini operations have separate error-handling routes.
+
+The configured Retry settings are:
+
+- HTTP: up to 3 retries, 15 minutes apart.
+- Gemini: up to 2 retries, 15 minutes apart.
+
+The error routes send alert emails. Repeated failures can generate multiple alerts because a separate single-alert-after-all-retries mechanism has not been added.
 
 ---
 
-## Testing and results
+## 5. Testing and Results
 
-Each test below states what I did, what I expected, what happened, and the evidence.
+The tests below cover different parts of the workflow. Their results should not be treated as if they all came from one execution.
 
-### Test A: full run, 3 pages, empty Data Store
+### Test A: Initial Run
 
-*Setup:* Data Store emptied, 3 pages, score threshold temporarily lowered to 0 so the digest email could be demonstrated.
+**Setup:** The Data Store was emptied, three pages were requested, and the score threshold was temporarily lowered to 0 to demonstrate the digest email.
 
-*Result:* 3 pages fetched, 7 remote keyword matches reached Gemini, 6 were scored and saved, 1 call failed with a temporary Gemini error (see Test D), and **one** digest email contained the jobs from all pages. The aggregator combined 6 jobs into 1 bundle.
+The original test notes record the following:
 
-| Evidence | |
+- 7 jobs reached Gemini.
+- 6 jobs were scored and saved.
+- 1 Gemini request failed temporarily.
+- The Text Aggregator combined the saved jobs into one bundle.
+- A digest email was generated.
+
+**Important:** The project notes contain a different count from another run: 8 jobs reached Gemini, 2 failed, and 6 were saved. Confirm the exact counts against the Make execution history before publishing them as final results.
+
+**Evidence**
+
+Canvas and operation counts:
+
+![Run A canvas](docs/screenshots/02-run-a-canvas-counts.png)
+
+Aggregator output:
+
+![Aggregator output](docs/screenshots/05-aggregator-output.png)
+
+Digest email:
+
+![Digest email](docs/screenshots/06-digest-email.png)
+
+Data Store records:
+
+![Data Store records](docs/screenshots/04-data-store-records.png)
+
+**Known issue:** The `reason` text appeared twice in some saved records because of a duplicate mapping in the Save Job module. This should be corrected before describing the saved records as clean.
+
+### Test B: Duplicate Job Check
+
+**Goal:** Previously saved jobs should not be sent to Gemini again.
+
+The recorded test showed:
+
+- 4 jobs passed the remote and keyword filter.
+- All 4 were identified as already present in the Data Store.
+- The Sleep, Gemini, and Save Job modules had 0 operations for those jobs.
+
+This shows how the existence check can reduce repeated processing.
+
+**Evidence**
+
+Canvas and operation counts:
+
+![Run B canvas](docs/screenshots/07-run-b-dedupe-canvas.png)
+
+Data Store existence check:
+
+![Existence check output](docs/screenshots/07a-check-existence-output.png)
+
+### Test C: Unexpected API Response
+
+**Setup:** The API path was intentionally changed to an incorrect path. The server returned an HTML page with HTTP status 200.
+
+This test showed why checking the status code alone is not enough.
+
+A response guard was designed to check the expected job array and JSON content type. During testing, a filter incorrectly compared the whole `Headers` collection instead of the individual `Content-Type` value. This caused valid responses to be sent to the fallback route.
+
+The filter was identified as the source of the problem. The final configuration must be verified to ensure that valid JSON follows the normal route and unexpected HTML follows the fallback route.
+
+**Evidence**
+
+Router filter:
+
+![Router filter rules](docs/screenshots/09-router-filter-rules.png)
+
+Fallback alert:
+
+![Fallback alert email](docs/screenshots/11-fallback-alert-email.png)
+
+### Test D: Error Handling
+
+| Test case | Recorded result |
 |---|---|
-| Canvas with operation counts | ![Run A canvas](docs/screenshots/02-run-a-canvas-counts.png) |
-| Aggregator output (6 jobs, 1 bundle) | ![Aggregator output](docs/screenshots/05-aggregator-output.png) |
-| Digest email | ![Digest email](docs/screenshots/06-digest-email.png) |
-| Stored records | ![Data Store records](docs/screenshots/04-data-store-records.png) |
+| HTTP 500 | The error-handling route sent an alert and used the configured Retry mechanism. |
+| Gemini 429 rate limit | Some requests failed before the Sleep module was added. |
+| Gemini 503 temporary overload | A request failed with a temporary server-side error. The error was handled and an alert was sent. |
 
-*Known issue:* in the stored records the `Reason` text appears twice. The Gemini output contains it once (see the aggregator output and the email); the duplication comes from a double mapping in the **Save job** module and does not affect scoring or the digest.
+The Sleep module was added to reduce rate-limit failures. It cannot prevent every temporary server-side error, which is why error handling is still important.
 
-### Test B: dedupe (second run, Data Store already filled)
+**Evidence**
 
-*Expectation:* jobs already stored must not reach Gemini again.
+HTTP 500:
 
-*Result:* 4 jobs passed the remote/keyword filter, **all 4 were recognised as already seen**, and Sleep, Gemini and Save job had **0 operations**. A repeat run therefore costs only the fetch and the existence checks.
+![HTTP 500 test](docs/screenshots/12-http-500-error.png)
 
-| Evidence | |
-|---|---|
-| Canvas: 4 jobs in, 0 passed the "already seen" filter | ![Run B canvas](docs/screenshots/07-run-b-dedupe-canvas.png) |
-| Existence check output | ![Existence check](docs/screenshots/07a-check-existence-output.png) |
+Gemini rate-limit alert:
 
-### Test C: response guard (bad URL)
+![Gemini rate-limit alert](docs/screenshots/06b-gemini-error-alert-email.png)
 
-*Setup:* the API path was changed on purpose. The server answered with an HTML page and status 200.
+Gemini 503 error:
 
-*Result:* the first version of the guard checked only that the job array existed, and let this response through. I added the `Content-Type` check. With both rules, the normal route did not run and the fallback route sent an alert showing the status code and content type.
+![Gemini 503 error](docs/screenshots/03b-gemini-503-handled-error.png)
 
-| Evidence | |
-|---|---|
-| Router filter (both rules) | ![Router filter](docs/screenshots/09-router-filter-rules.png) |
-| Fallback alert email | ![Fallback alert](docs/screenshots/11-fallback-alert-email.png) |
+### Score Filter and Gemini Prompt
 
-During testing I also found a bug in my own guard: a rule compared the whole `Headers` collection instead of the `Content-Type` field, so every response was sent to the fallback. Testing with real traffic caught it, and I fixed the field.
+The following screenshots show the scoring threshold and the instructions sent to Gemini.
 
-### Test D: error handling
-
-| Case | What happened | Evidence |
-|---|---|---|
-| HTTP server error (500) | Error route sent an alert and Retry saved the run | ![HTTP error alert](docs/screenshots/12-http-500-error.png) |
-| Gemini rate limit (429, 5 requests/minute) | Early runs without Sleep failed on some jobs; alert email showed the error and the job title | ![Gemini rate limit alert](docs/screenshots/06b-gemini-error-alert-email.png) |
-| Gemini overload (503, "high demand") | After adding Sleep, one call still failed with a temporary 503; it was caught, the job was not stored, and an alert was sent | ![Gemini 503](docs/screenshots/03b-gemini-503-handled-error.png) |
-
-Adding the Sleep module removed the rate-limit failures. A 503 is a temporary server-side error that can still happen, which is exactly what the alert and Retry route is for.
-
-### Score threshold and prompt
-
-| Threshold filter | Prompt (system instructions) |
+| Score filter | Gemini prompt |
 |---|---|
 | ![Score filter](docs/screenshots/08-score-filter-final.png) | ![Gemini prompt](docs/screenshots/20-gemini-prompt.png) |
 
 ---
 
-## Evaluating the AI scoring
+## 6. Evaluating the AI Scores
 
-I checked the model's scores against the job descriptions instead of trusting them.
+I checked Gemini's scores against job details instead of assuming every result was correct.
 
-**A wrong score and how I fixed it.** A "Test Automation Engineer" posting first received a score of **7**. The job needed 5+ years of experience, was limited to candidates inside the EU, and was software QA testing, not workflow automation. The model had only seen the title, company, location and tags. After adding the cleaned description (first 2000 characters) and stricter rules to the prompt, the same job scored **1**, and the reason named all three problems.
+### Example: Fixing an Incorrect Score
 
-| | Input to Gemini | Score |
-|---|---|---|
-| Before | title, company, location, tags | 7 |
-| After | + description (2000 characters) + rules for seniority, region restrictions and QA testing | 1 |
+A job titled **Test Automation Engineer** initially received a score of 7.
 
-**Sample of stored records from the demo run:**
+The job required more than five years of experience, was restricted to candidates within the EU, and focused on software QA testing rather than workflow automation.
 
-| Job | Score | Gemini's reasoning (short) |
-|---|---|---|
-| GTM Manager - AI Startup | 1 | Sales role requiring a specific market language |
-| Customs AI Integration & Automation Engineer (France) | 3 | Good topical match, but a location restriction in the title |
-| ServiceNow AI Architect | 3 | Relevant duties, but a senior role |
+Initially, Gemini received only the title, company, location, and tags. It did not have enough information to judge the match properly.
 
-This is a small sample, so it shows how the scoring behaves; it is not a measured accuracy figure. Scores can still be wrong, and borderline cases (such as location restrictions mentioned only in the title) deserve a manual look.
+After the job description and stricter scoring rules were added, the same job received a score of 1.
+
+| Version | Information sent to Gemini | Score |
+|---|---|---:|
+| Before | Title, company, location, and tags | 7 |
+| After | The same information plus the job description and stricter rules | 1 |
+
+This example shows that AI scores depend on the quality of the input data and the scoring instructions.
+
+### Sample Scored Jobs
+
+The following examples are from the recorded demo results.
+
+| Job | Score | Short explanation |
+|---|---:|---|
+| GTM Manager - AI Startup | 1 | Sales-focused role with a specific language requirement |
+| Customs AI Integration & Automation Engineer (France) | 3 | Relevant topic, but a location restriction was present |
+| ServiceNow AI Architect | 3 | Relevant work, but a senior-level role |
+
+This is a small sample, not a formal accuracy measurement. AI scores can still be wrong, so borderline jobs should be reviewed manually.
 
 ---
 
-## Cost and limits
+## 7. Cost and Limits
 
-* One module operation costs one credit. For example, Gemini with 7 operations used 7 credits, and the HTTP module with 3 operations used 3 credits. Filters and the router were not counted.
-* A repeat run with nothing new is cheap (fetch + iterator + existence checks only). Credit numbers for whole runs are estimates from the operation counts.
-* Free plan limits I worked within: 1,000 credits per month, 2 active scenarios, a 5-minute maximum run time. With a 20-second sleep per new job, roughly 13 new jobs fit into one run.
-* Alerts fire on **each** failure (first attempt and every retry). I did not add logic to send a single final alert.
-* When the scenario is inactive, saved incomplete executions are not retried automatically.
+- Each module operation uses a Make credit. Filters and routers were not counted as module operations in the tests.
+- The Gemini module uses credits when it processes a job, so filtering and deduplication before Gemini help control usage.
+- The free-plan limits recorded during development were 1,000 credits per month, two active scenarios, and a five-minute maximum run time. These limits may change.
+- A 20-second Sleep module limits how quickly new jobs can reach Gemini.
+- Error alerts may be sent for each failed attempt or retry.
+- Saved incomplete executions are not automatically retried while the scenario is inactive.
 
-## Known limitations
+Credit usage depends on the number of pages, jobs, module operations, and retries. Actual usage should be checked in Make.
 
-* **Data source:** Arbeitnow is a German-focused board, so few jobs match a remote junior AI-automation profile. Many results are senior or region-restricted.
-* **Single profile:** the candidate profile, the keyword regex and the score threshold are hard-coded in the scenario.
-* **Scoring input:** only metadata and the first 2000 characters of the description are scored.
-* **One source:** no other job boards are combined.
-* **Reason duplicated** in the stored records (mapping issue described in Test A).
-* The Gemini free-tier limits (requests per minute, availability) can change; the 20-second sleep is tuned to the limit I observed.
+---
 
-## How to adapt this scenario
+## 8. Known Limitations
 
-1. **Candidate profile and rubric:** edit the Gemini *System Instructions* (profile, target role, scoring rules, location).
-2. **Keywords:** edit the regex in the *Filter* after the Iterator.
-3. **Minimum score:** edit the filter before the text aggregator.
-4. **Pages:** change *Repeats* on the Repeater (page 1 is usually enough for a daily run because newest jobs come first).
-5. **Recipient and sender:** set your own mailbox in the Gmail modules.
+1. **Job source:** Arbeitnow is German-focused, so relevant remote junior AI automation jobs may be limited.
+2. **Candidate profile:** The candidate profile, keyword regex, and score threshold are configured inside the scenario.
+3. **Limited job information:** Gemini receives metadata and only the first 2,000 characters of the cleaned description.
+4. **Single source:** The workflow currently uses only one job board.
+5. **Duplicate reason mapping:** Some saved records may contain duplicated reason text until the Save Job mapping is corrected.
+6. **AI scoring:** Gemini can make mistakes. Scores should be treated as recommendations, not final decisions.
+7. **Provider limits:** Gemini request limits and availability can change.
+
+---
+
+## 9. How to Adapt the Workflow
+
+1. **Candidate profile:** Update Gemini's System Instructions with the target role, skills, location, and scoring rules.
+2. **Keywords:** Change the regex in the filter after the Iterator.
+3. **Minimum score:** Change the score filter before the Text Aggregator.
+4. **Number of pages:** Adjust the Repeater count. More pages may find more jobs but will use more credits.
+5. **Email settings:** Select your own Gmail connection and configure the recipient.
+6. **Data Store:** Make sure the required fields and key are configured correctly before running the workflow.
 
 ### Setup
 
-1. Create a Data Store `DS_job_radar` with a structure containing: `slug` (key), `title`, `company_name`, `location`, `remote` (boolean), `url`, `tags` (text), `created_at` (number), `score` (number), `reason` (text).
-2. Import `blueprint/job-radar-blueprint.json` into Make (a sanitized export: connections and email addresses are removed).
-3. Create your own **Gmail** and **Google Gemini** connections and select them in the modules. Never commit API keys.
-4. Run once manually, then check the Data Store before activating any schedule.
+1. Create a Make Data Store named `DS_job_radar` with these fields:
+   - `slug` (key)
+   - `title`
+   - `company_name`
+   - `location`
+   - `remote` (boolean)
+   - `url`
+   - `tags` (text)
+   - `created_at` (number)
+   - `score` (number)
+   - `reason` (text)
 
-## Possible next steps
+2. Recreate the workflow in Make.com using the architecture and screenshots in this repository. **The Make.com blueprint is not included in this project.**
 
-* Add a second source (for example another remote job API) and merge the results using a common field schema.
-* Move the profile, keywords and threshold into a config Data Store so the scenario becomes a reusable template.
-* Stop paginating automatically once a page contains only already-seen jobs.
-* Send one final alert after all retries fail, instead of one per attempt.
-* Add an "eligible from my country" field to the Gemini output.
+3. Create your own Gmail and Google Gemini connections and select them in the relevant modules. Never publish API keys, credentials, or private connection details.
 
-## What I practiced
+4. Run the scenario manually and check the execution history and Data Store results before enabling any schedule.
 
-Page-based pagination, Data Stores (existence checks, overwrite by key), regex filters, structured AI output, aggregators and grouping, rate limiting, router fallback routes, error handlers with Retry, and testing a scenario with real failures and then fixing what the tests exposed.
+---
 
-## Credits and attribution
+## 10. Possible Improvements
 
-* Job data from [Arbeitnow](https://www.arbeitnow.com) (free API, no key). Jobs are linked back to their Arbeitnow pages, and the digest email names the source.
-* Built with [Make](https://www.make.com) and Google Gemini.
+- Add another job source and combine the results using a common field structure.
+- Move the candidate profile, keywords, and score threshold into a configuration Data Store.
+- Stop pagination when a page contains only jobs that have already been seen.
+- Send one final alert after all retries fail instead of sending an alert for every attempt.
+- Add a field to evaluate whether a job accepts applicants from the candidate's country.
+- Fix the duplicate `reason` mapping in the Save Job module.
+- Complete and verify the response guard tests for valid JSON and unexpected HTML.
+
+---
+
+## 11. What I Practiced
+
+This project helped me apply:
+
+- Page-based pagination with a Repeater.
+- Data Stores and existence checks.
+- Duplicate prevention using a unique key.
+- Regex filters and word boundaries.
+- Structured AI output with Google Gemini.
+- Job-fit scoring and prompt improvement.
+- Text aggregation and email digests.
+- Rate limiting.
+- Router fallback routes.
+- Error handlers and Retry.
+- Testing, debugging, and documenting real workflow issues.
+
+---
+
+## 12. Credits and Attribution
+
+- Job data comes from the free [Arbeitnow API](https://www.arbeitnow.com/blog/job-board-api).
+- The workflow was built using [Make.com](https://www.make.com) and Google Gemini.
+- Job links point to their original Arbeitnow pages.
 
 ## Author
 
-Hassan Haider, GitHub: [HassanHaider-ai](https://github.com/HassanHaider-ai/)
+**Hassan Haider**
+
+GitHub: [HassanHaider-ai](https://github.com/HassanHaider-ai/)
